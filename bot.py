@@ -36,4 +36,4 @@ def start(message):
     logging.debug(f"User {chat_id} started interaction.")
 
 @bot.message_handler(func=lambda m: True)
-def get_response(message)_
+def get_response(message):
