@@ -1,6 +1,18 @@
 import os
+import threading
+from flask import Flask
 import telebot
 from openai import OpenAI
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Bot is running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -77,4 +89,5 @@ def solve_conflict(message):
     bot.send_message(chat_id, verdict)
 
 if __name__ == "__main__":
+    threading.Thread(target=run_flask).start()
     bot.polling(none_stop=True)
