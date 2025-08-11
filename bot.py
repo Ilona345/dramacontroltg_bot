@@ -89,6 +89,6 @@ def solve_conflict(message):
     bot.send_message(chat_id, verdict)
 
 if __name__ == "__main__":
-bot.remove_webhook()
+    bot.remove_webhook()
     threading.Thread(target=run_flask).start()
     bot.polling(none_stop=True)
