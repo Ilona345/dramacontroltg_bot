@@ -1,105 +1,185 @@
+# main.py
 import os
-import logging
-import telebot
-from openai import OpenAI
+import json
+import asyncio
+from datetime import datetime
+import openai
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from openai import OpenAI   # <-- импорт OpenAI тут
 
-# Настройка логирования — максимум подробностей
-logging.basicConfig(
-    format='%(asctime)s %(levelname)s %(message)s',
-    level=logging.DEBUG
+client = OpenAI(api_key=OPENAI_API_KEY)  
+# --- Настройки (из env) ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+DAILY_QUOTA = int(os.environ.get('DAILY_QUOTA', '3'))
+
+openai.api_key = OPENAI_API_KEY
+
+# --- Внутренняя память сессий (demo). Для продакшна: БД. ---
+sessions = {}  # chat_id -> {'state': 'idle'|'asking1'|'asking2'|'ready', 'answers': {'A':..., 'B':...}}
+
+QUOTA_FILE = "quota.json"
+
+def load_quota():
+    try:
+        with open(QUOTA_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {"date": today_str(), "count": 0}
+    # reset if date changed
+    if data.get("date") != today_str():
+        data = {"date": today_str(), "count": 0}
+    return data
+
+def save_quota(q):
+    with open(QUOTA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(q, f)
+
+def today_str():
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def increment_quota():
+    q = load_quota()
+    q['count'] += 1
+    save_quota(q)
+    return q['count']
+
+def quota_remaining():
+    q = load_quota()
+    return max(0, DAILY_QUOTA - q['count'])
+
+# --- Промпт (жёсткий арбитр) ---
+SYSTEM_PROMPT = (
+    "Ты — очень жёсткий, безэмоциональный арбитр. Твоя задача — вынести однозначный и категоричный вердикт: "
+    "ПРАВА ЛИБО СТОРОНА A, ЛИБО СТОРОНА B. Не оставляй неопределённостей в вердикте — выбери одну сторону даже при недостатке данных; "
+    "при этом обязательно перечисли ключевые допущения, из-за которых вынесен вердикт. Строго отделяй факты от интерпретаций, "
+    "выявляй и отмечай манипуляции и передёргивания. Пиши коротко, нумерованными пунктами. Не давай юридических консультаций. "
+    "Если в тексте есть угрозы насилия, признания в тяжёлом преступлении или явная срочная опасность — НЕ выносить категоричный вердикт, "
+    "а рекомендовать обратиться в экстренные службы / правоохранительные органы."
 )
 
-telebot.logger.setLevel(logging.DEBUG)  # Логируем телеграм-бот полностью
+USER_TEMPLATE = (
+    "Участник A:\n{a}\n\nУчастник B:\n{b}\n\n"
+    "Выполни строго по пунктам:\n"
+    "1) Подтверждаемые факты (максимум 6 пунктов) — каждая строка: [A:] или [B:] + факт.\n"
+    "2) Явные противоречия между описаниями.\n"
+    "3) Манипуляции / передёргивания — укажи точные фразы и почему.\n"
+    "4) ВЕРДИКТ (caps): ПРАВА СТОРОНА A  — или — ПРАВА СТОРОНА B.\n"
+    "5) Краткое обоснование (2-3 предложения).\n"
+    "6) Рекомендация: один оптимальный вариант разрешения конфликта и пошаговый план примирения (не более 3 шага).\n"
+    "Ограничение: итог не более 400 слов."
+)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# --- UI ---
+WELCOME = (
+    "Бот поможет объективно решить любой конфликт. По очереди опишите, что случилось по мнению каждого участника. "
+    "Затем нажмите кнопку «Решить конфликт»."
+)
 
-if not BOT_TOKEN or not OPENAI_API_KEY:
-    logging.error("BOT_TOKEN или OPENAI_API_KEY не заданы в переменных окружения")
-    exit(1)
+def kb_button(text, cb):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=cb)]])
 
-bot = telebot.TeleBot(BOT_TOKEN)
-client = OpenAI(api_key=OPENAI_API_KEY)
+# --- Handlers ---
+async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sessions[chat_id] = {'state': 'idle', 'answers': {'A': None, 'B': None}}
+    await update.effective_chat.send_message(WELCOME, reply_markup=kb_button("Начать", "begin"))
 
-user_data = {}
+async def cb_begin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chat_id = q.message.chat_id
+    sessions.setdefault(chat_id, {'state': 'idle', 'answers': {'A': None, 'B': None}})
+    sessions[chat_id]['state'] = 'asking1'
+    sessions[chat_id]['answers'] = {'A': None, 'B': None}
+    await q.message.reply_text("Начинаем. Участник 1: Опишите, пожалуйста, что случилось.")
 
-@bot.message_handler(commands=["start"])
-def start(message):
-    chat_id = message.chat.id
-    user_data[chat_id] = {"step": 0, "side1": None, "side2": None}
-    bot.send_message(chat_id,
-                     "Бот поможет объективно решить любой конфликт.\n"
-                     "По очереди опишите, что случилось по мнению каждого участника конфликта.\n"
-                     "Затем напишите /solve, чтобы получить вердикт.\n\n"
-                     "Сначала — сторона 1:\nЧто случилось по Вашему мнению?")
-    user_data[chat_id]["step"] = 1
-    logging.debug(f"User {chat_id} started interaction.")
-
-@bot.message_handler(func=lambda m: True)
-def get_response(message):
-    chat_id = message.chat.id
-    if chat_id not in user_data:
-        bot.send_message(chat_id, "Напишите /start, чтобы начать.")
-        logging.debug(f"User {chat_id} sent message without starting: {message.text}")
+async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+    sess = sessions.get(chat_id)
+    if not sess:
+        await update.message.reply_text("Нажмите /start, чтобы начать сессию.")
         return
 
-    step = user_data[chat_id]["step"]
+    state = sess['state']
 
-    if step == 1:
-        user_data[chat_id]["side1"] = message.text
-        bot.send_message(chat_id, "Теперь — сторона 2:\nЧто произошло с Вашей точки зрения?")
-        user_data[chat_id]["step"] = 2
-        logging.debug(f"User {chat_id} provided side1: {message.text}")
-
-    elif step == 2:
-        user_data[chat_id]["side2"] = message.text
-        bot.send_message(chat_id, "Отлично! Напишите /solve, чтобы вынести вердикт.")
-        user_data[chat_id]["step"] = 3
-        logging.debug(f"User {chat_id} provided side2: {message.text}")
-
-@bot.message_handler(commands=["solve"])
-def solve_conflict(message):
-    chat_id = message.chat.id
-    data = user_data.get(chat_id)
-
-    if not data or not data["side1"] or not data["side2"]:
-        bot.send_message(chat_id, "Сначала введите версии обеих сторон.")
-        logging.debug(f"User {chat_id} tried to solve without both sides.")
+    if state == 'asking1':
+        sess['answers']['A'] = text
+        sess['state'] = 'asking2'
+        await update.message.reply_text("Теперь Участник 2: Опишите, что произошло с Вашей точки зрения.")
         return
 
-    prompt = f"""
-Ты — жёсткий арбитр, который всегда определяет одну победившую сторону в конфликте.
-Две версии конфликта:
-
-Сторона 1: {data['side1']}
-Сторона 2: {data['side2']}
-
-Требования:
-1. Определи победителя (Сторона 1 или Сторона 2) — без вариантов "оба виноваты".
-2. Обоснуй решение по пунктам.
-3. Обязательно укажи, где каждая сторона использует манипуляции или передёргивания фактов.
-4. Сохрани нейтральный тон, но будь прямолинеен.
-5. После вердикта дай конкретный план примирения для обеих сторон.
-"""
-    logging.debug(f"User {chat_id} prompt for OpenAI:\n{prompt}")
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Ты опытный арбитр по конфликтам, принимающий жёсткие решения."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3
+    if state == 'asking2':
+        sess['answers']['B'] = text
+        sess['state'] = 'ready'
+        await update.message.reply_text(
+            "Оба ответа получены. Нажмите «Решить конфликт» для получения анализа.",
+            reply_markup=kb_button("Решить конфликт", "resolve")
         )
-        verdict = response.choices[0].message["content"]
-        logging.debug(f"User {chat_id} received verdict:\n{verdict}")
-        bot.send_message(chat_id, verdict)
+        return
+
+    if state == 'ready':
+        await update.message.reply_text("Ответы уже получены. Нажмите «Решить конфликт», чтобы получить анализ или /start для новой сессии.")
+        return
+
+    await update.message.reply_text("Нажмите 'Решить конфликт' для начала.")
+
+async def cb_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chat_id = q.message.chat_id
+    sess = sessions.get(chat_id)
+    if not sess or sess.get('state') != 'ready':
+        await q.message.reply_text("Сессия не готова к разрешению. Нажмите «Решить конфликт», чтобы начать.")
+        return
+
+    # quota check
+    rem = quota_remaining()
+    if rem <= 0:
+        await q.message.reply_text("Достигнут дневной лимит запросов к ИИ. Попробуйте завтра или измените DAILY_QUOTA.")
+        return
+
+    a = sess['answers']['A'] or ""
+    b = sess['answers']['B'] or ""
+    user_text = USER_TEMPLATE.format(a=a, b=b)
+
+    await q.message.reply_text(f"Отправляю запрос на решение конфликта. Осталось запросов сегодня: {rem-1}")
+
+    def call_openai(messages):
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",  # поменяли модель
+            messages=messages,
+            temperature=0.0,
+            max_tokens=800
+        )
+        return resp.choices[0].message.content
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_text}
+    ]
+
+    # sync call in thread
+    try:
+        result = await asyncio.to_thread(call_openai, messages)
+        increment_quota()
     except Exception as e:
-        logging.error(f"OpenAI request failed for user {chat_id}: {e}")
-        bot.send_message(chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
+        result = f"Ошибка при вызове LLM: {e}"
+
+    # отправляем результат; кнопка остается для повторных итераций
+    await q.message.reply_text(result, reply_markup=kb_button("Старт", "begin"))
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(cb_begin, pattern="^begin$"))
+    app.add_handler(CallbackQueryHandler(cb_resolve, pattern="^resolve$"))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
+    print("Bot started (polling)...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    bot.remove_webhook()
-    logging.info("Запуск бота...")
-    bot.polling(none_stop=True)
+    main()
+
