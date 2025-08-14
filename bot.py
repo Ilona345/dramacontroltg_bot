@@ -8,12 +8,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI   # <-- импорт OpenAI тут
 
-client = OpenAI(api_key=OPENAI_API_KEY)  
+
 # --- Настройки (из env) ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DAILY_QUOTA = int(os.environ.get('DAILY_QUOTA', '3'))
-
+client = OpenAI(api_key=OPENAI_API_KEY)  
 openai.api_key = OPENAI_API_KEY
 
 # --- Внутренняя память сессий (demo). Для продакшна: БД. ---
