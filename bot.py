@@ -21,33 +21,52 @@ sessions = {}  # chat_id -> {'state': 'idle'|'asking1'|'asking2'|'ready', 'answe
 
 QUOTA_FILE = "quota.json"
 
+# --- Квоты на пользователя ---
 def load_quota():
     try:
         with open(QUOTA_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except FileNotFoundError:
-        data = {"date": today_str(), "count": 0}
-    # reset if date changed
-    if data.get("date") != today_str():
-        data = {"date": today_str(), "count": 0}
+        data = {}
     return data
 
-def save_quota(q):
+def save_quota(data):
     with open(QUOTA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(q, f)
+        json.dump(data, f)
 
-def today_str():
-    return datetime.utcnow().strftime("%Y-%m-%d")
+def quota_remaining(user_id):
+    data = load_quota()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    user_info = data.get(str(user_id), {"date": today, "count": 0})
+    
+    # если дата старая, сбросить счётчик
+    if user_info["date"] != today:
+        user_info = {"date": today, "count": 0}
+        data[str(user_id)] = user_info
+        save_quota(data)
+    
+    return max(0, DAILY_QUOTA - user_info["count"])
 
-def increment_quota():
+def increment_quota(user_id):
+    data = load_quota()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    user_info = data.get(str(user_id), {"date": today, "count": 0})
+    
+    if user_info["date"] != today:
+        user_info = {"date": today, "count": 0}
+    
+    user_info["count"] += 1
+    user_info["date"] = today
+    data[str(user_id)] = user_info
+    save_quota(data)
+    return user_info["count"]
+
+
+async def reset_quota(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = load_quota()
-    q['count'] += 1
+    q.pop(str(update.effective_user.id), None)
     save_quota(q)
-    return q['count']
-
-def quota_remaining():
-    q = load_quota()
-    return max(0, DAILY_QUOTA - q['count'])
+    await update.message.reply_text("Ограничения сброшены, босс!")
 
 # --- Промпт (жёсткий арбитр) ---
 SYSTEM_PROMPT = (
@@ -89,6 +108,12 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_begin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    user_id = q.from_user.id
+    if quota_remaining(user_id) <= 0:
+        await q.message.reply_text("Достигнут дневной лимит разбора конфликтов. Хватит ссориться! Любите друг друга!")
+        return
+    increment_quota(user_id)
+
     chat_id = q.message.chat_id
     sessions.setdefault(chat_id, {'state': 'idle', 'answers': {'A': None, 'B': None}})
     sessions[chat_id]['state'] = 'asking1'
@@ -135,21 +160,15 @@ async def cb_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Сессия не готова к разрешению. Нажмите «Решить конфликт», чтобы начать.")
         return
 
-    # quota check
-    rem = quota_remaining()
-    if rem <= 0:
-        await q.message.reply_text("Достигнут дневной лимит запросов к ИИ. Попробуйте завтра или измените DAILY_QUOTA.")
-        return
-
     a = sess['answers']['A'] or ""
     b = sess['answers']['B'] or ""
     user_text = USER_TEMPLATE.format(a=a, b=b)
 
-    await q.message.reply_text(f"Отправляю запрос на решение конфликта. Осталось запросов сегодня: {rem-1}")
+    await q.message.reply_text(f"Отправляю запрос на решение конфликта.")
 
     def call_openai(messages):
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",  # поменяли модель
+            model="gpt-4o-mini",
             messages=messages,
             temperature=0.0,
             max_tokens=800
@@ -161,19 +180,17 @@ async def cb_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         {"role": "user", "content": user_text}
     ]
 
-    # sync call in thread
     try:
         result = await asyncio.to_thread(call_openai, messages)
-        increment_quota()
     except Exception as e:
         result = f"Ошибка при вызове LLM: {e}"
 
-    # отправляем результат; кнопка остается для повторных итераций
     await q.message.reply_text(result, reply_markup=kb_button("Старт", "begin"))
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("reset_quota", reset_quota))
     app.add_handler(CallbackQueryHandler(cb_begin, pattern="^begin$"))
     app.add_handler(CallbackQueryHandler(cb_resolve, pattern="^resolve$"))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
@@ -182,4 +199,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
